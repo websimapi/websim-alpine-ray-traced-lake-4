@@ -1,0 +1,540 @@
+import * as THREE from 'three';
+import { Terrain } from './components/Terrain.js';
+import { WaterSystem } from './components/Water.js';
+import { SkySystem } from './components/Sky.js';
+import { Trees } from './components/Trees.js';
+import { Player } from './components/Player.js';
+import { CameraController } from './components/CameraController.js';
+import { Atmosphere } from './components/Atmosphere.js';
+import { NetworkPlayers } from './components/NetworkPlayers.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+export class World {
+    constructor(canvas, room) {
+        this.canvas = canvas;
+        this.room = room; // WebsimSocket
+        this.scene = null;
+        this.camera = null;
+        this.renderer = null;
+        this.composer = null; // Post-processing
+        this.cameraController = null;
+        this.player = null;
+        this.raycaster = new THREE.Raycaster();
+        this.rayDown = new THREE.Vector3(0, -1, 0);
+        
+        this.terrain = null;
+        this.water = null;
+        this.sky = null;
+        this.trees = null;
+        this.atmosphere = null;
+        this.clock = new THREE.Clock();
+        this.audioContext = null;
+        this.sound = null;
+        this.networkPlayers = null;
+        this.presenceTimer = 0;
+        
+        // VR
+        this.dolly = null;
+        this.controllers = [];
+        this.vrViewMode = '1st'; // '1st' or '3rd'
+        this.vrInput = {
+            move: new THREE.Vector2(),
+            rotate: 0,
+            switchViewPressed: false
+        };
+    }
+
+    async init() {
+        // Renderer
+        this.renderer = new THREE.WebGLRenderer({ 
+            canvas: this.canvas, 
+            antialias: false, // Turn off native antialias if using post-processing for performance
+            powerPreference: "high-performance",
+            stencil: false,
+            depth: true
+        });
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        this.renderer.toneMappingExposure = 0.8; // Bump exposure slightly
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        // Scene
+        this.scene = new THREE.Scene();
+        
+        // Camera
+        this.camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.5, 20000);
+        this.camera.position.set(0, 30, 100);
+
+        // VR Dolly
+        this.dolly = new THREE.Group();
+        this.dolly.add(this.camera);
+        this.scene.add(this.dolly);
+
+        // VR Controllers
+        const controller1 = this.renderer.xr.getController(0);
+        const controller2 = this.renderer.xr.getController(1);
+        this.dolly.add(controller1);
+        this.dolly.add(controller2);
+        this.controllers = [controller1, controller2];
+
+        // Fog
+        this.defaultFogColor = 0x5ca5c9;
+        this.underwaterFogColor = 0x001e0f;
+        this.scene.fog = new THREE.FogExp2(this.defaultFogColor, 0.0025); 
+
+        // --- DATABASE SYNC (Collections) ---
+        // 1. Setup User Info
+        const currentUser = await window.websim.getCurrentUser();
+        const createdBy = await window.websim.getCreatedBy();
+        const isHost = currentUser && createdBy && currentUser.username === createdBy.username;
+        this.currentUser = currentUser; 
+
+        // 2. Fetch/Create Records
+        const collection = this.room.collection('players');
+        let records = await collection.getList();
+        
+        // Find Creator's Record (For Map Data / Column 11)
+        let creatorRecord = records.find(r => r.username === createdBy.username);
+        
+        let seed = 12345;
+        let mapData = null;
+
+        if (creatorRecord && creatorRecord.column11 && creatorRecord.column11.seed) {
+            mapData = creatorRecord.column11;
+            seed = mapData.seed;
+            console.log("Loaded seed from Database (Creator's Row):", seed);
+        } else {
+            console.log("No existing map data found in DB.");
+            if (isHost) {
+                seed = Math.floor(Math.random() * 100000);
+                mapData = { seed: seed, generated: Date.now() };
+                console.log("Host generated new seed:", seed);
+            }
+        }
+
+        // Find My Record (For Player Data / Column 1)
+        let myRecord = records.find(r => r.username === currentUser.username);
+
+        if (!myRecord) {
+            console.log("Creating new DB row for user:", currentUser.username);
+            const initialData = {
+                column1: { x: 0, y: 100, z: 0 }, 
+                // Empty columns 2-10 as requested
+                column2: {}, column3: {}, column4: {}, column5: {},
+                column6: {}, column7: {}, column8: {}, column9: {}, column10: {}
+            };
+            
+            if (isHost && mapData) {
+                initialData.column11 = mapData;
+            }
+
+            try {
+                myRecord = await collection.create(initialData);
+            } catch (e) {
+                console.error("Error creating record:", e);
+                // Fallback if create fails (e.g. race condition), try fetch again
+                records = await collection.getList();
+                myRecord = records.find(r => r.username === currentUser.username);
+            }
+        } else {
+            // If I am host and map data is new/updated, save it to my existing record
+            if (isHost && mapData && (!myRecord.column11 || myRecord.column11.seed !== seed)) {
+                await collection.update(myRecord.id, { column11: mapData });
+            }
+        }
+
+        this.myRecordId = myRecord ? myRecord.id : null;
+
+        // Components
+        this.sky = new SkySystem(this.scene, this.renderer);
+        const sunPos = this.sky.updateSky();
+
+        // Lighting
+        const sunLight = new THREE.DirectionalLight(0xfffaed, 3.0); // Brighter sun
+        sunLight.position.copy(sunPos);
+        sunLight.castShadow = true;
+        
+        // Shadow optimization
+        sunLight.shadow.mapSize.width = 4096; // Higher res shadows
+        sunLight.shadow.mapSize.height = 4096;
+        const d = 400;
+        sunLight.shadow.camera.left = -d;
+        sunLight.shadow.camera.right = d;
+        sunLight.shadow.camera.top = d;
+        sunLight.shadow.camera.bottom = -d;
+        sunLight.shadow.bias = -0.00005;
+        sunLight.shadow.normalBias = 0.05; // Helps with acne on terrain
+        
+        this.scene.add(sunLight);
+
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.6); 
+        this.scene.add(ambientLight);
+
+        // Load Async Components
+        this.terrain = new Terrain(this.scene);
+        await this.terrain.load();
+        const terrainMesh = this.terrain.generate(seed);
+
+        this.water = new WaterSystem(this.scene);
+        await this.water.load();
+        this.water.setSunDirection(sunLight.position);
+
+        this.trees = new Trees(this.scene, terrainMesh);
+        this.trees.generate();
+        
+        // Atmosphere particles
+        this.atmosphere = new Atmosphere(this.scene);
+        this.atmosphere.create();
+
+        // Player & Camera Setup
+        this.player = new Player(this.scene, false);
+        
+        // Restore position from DB if available
+        let posRestored = false;
+        if (myRecord && myRecord.column1 && myRecord.column1.x !== undefined) {
+            const { x, y, z, rot } = myRecord.column1;
+            // Validate coords (avoid NaN)
+            if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
+                this.player.position.set(x, y, z);
+                this.player.rotation = rot || 0;
+                posRestored = true;
+            }
+        } 
+        
+        if (!posRestored) {
+            // Default Start
+            const startY = this.getTerrainHeight(0, 0);
+            this.player.position.set(0, startY + 5, 0);
+        }
+        
+        // Sync mesh immediately
+        this.player.mesh.position.copy(this.player.position);
+        this.player.mesh.rotation.y = this.player.rotation;
+        
+        // Init Dolly
+        this.dolly.position.copy(this.player.position);
+        this.dolly.rotation.y = this.player.rotation;
+
+        this.networkPlayers = new NetworkPlayers(this.scene, this.room);
+
+        this.cameraController = new CameraController(this.camera, this.canvas);
+        this.cameraController.setTarget(this.player.mesh);
+
+        // Setup Post-Processing
+        this.setupPostProcessing();
+
+        // Handle window resize
+        window.addEventListener('resize', () => this.onResize());
+    }
+
+    setupPostProcessing() {
+        this.composer = new EffectComposer(this.renderer);
+        
+        const renderPass = new RenderPass(this.scene, this.camera);
+        this.composer.addPass(renderPass);
+
+        // Underwater Distortion Pass
+        const UnderwaterShader = {
+            uniforms: {
+                tDiffuse: { value: null },
+                time: { value: 0 },
+                enabled: { value: 0.0 }, // 0 = off, 1 = on
+                color: { value: new THREE.Color(0x001e0f) }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float time;
+                uniform float enabled;
+                uniform vec3 color;
+                varying vec2 vUv;
+                
+                void main() {
+                    vec2 uv = vUv;
+                    
+                    if (enabled > 0.5) {
+                        // Wobble
+                        uv.x += sin(uv.y * 15.0 + time) * 0.003;
+                        uv.y += cos(uv.x * 12.0 + time * 1.5) * 0.003;
+                        
+                        // Chromatic aberration (simple shift)
+                        float r = texture2D(tDiffuse, uv + vec2(0.002, 0.0)).r;
+                        float g = texture2D(tDiffuse, uv).g;
+                        float b = texture2D(tDiffuse, uv - vec2(0.002, 0.0)).b;
+                        vec3 tex = vec3(r, g, b);
+                        
+                        // Blue tint
+                        vec3 tint = color * 1.5;
+                        vec3 final = mix(tex, tint, 0.6);
+                        
+                        // Vignette
+                        float dist = distance(vUv, vec2(0.5));
+                        float vignette = smoothstep(0.8, 0.2, dist);
+                        
+                        gl_FragColor = vec4(final * vignette, 1.0);
+                    } else {
+                        gl_FragColor = texture2D(tDiffuse, uv);
+                    }
+                }
+            `
+        };
+
+        this.underwaterPass = new ShaderPass(UnderwaterShader);
+        this.composer.addPass(this.underwaterPass);
+
+        // Bloom for AAA glow
+        const bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            1.5, 0.4, 0.85
+        );
+        bloomPass.threshold = 0.6; // Only very bright things glow
+        bloomPass.strength = 0.4;
+        bloomPass.radius = 0.5;
+        this.composer.addPass(bloomPass);
+
+        // Color correction
+        const outputPass = new OutputPass();
+        this.composer.addPass(outputPass);
+    }
+
+    start() {
+        this.renderer.setAnimationLoop(() => {
+            this.update();
+            this.render();
+        });
+    }
+
+    getTerrainHeight(x, z) {
+        if (!this.terrain || !this.terrain.getMesh()) return 0;
+        
+        // Raycast down from high up
+        this.raycaster.set(new THREE.Vector3(x, 5000, z), this.rayDown);
+        const intersects = this.raycaster.intersectObject(this.terrain.getMesh());
+        
+        if (intersects.length > 0) {
+            return intersects[0].point.y;
+        }
+        return -100; // Fall into "water" if off-map
+    }
+
+    update() {
+        const delta = this.clock.getDelta();
+        const time = this.clock.getElapsedTime();
+
+        const isXR = this.renderer.xr.isPresenting;
+
+        // VR Input
+        if (isXR) {
+            this.handleVRInput(delta);
+        }
+
+        // 1. Check Underwater State
+        const waterLevel = -2; // Hardcoded in Water.js, should match
+        const isUnderwater = this.camera.position.y < waterLevel;
+
+        // 2. Update Post-Processing & Fog
+        if (isUnderwater) {
+            this.scene.fog.density = 0.05; // Dense fog
+            this.scene.fog.color.setHex(this.underwaterFogColor);
+            if (this.underwaterPass) {
+                this.underwaterPass.uniforms.enabled.value = 1.0;
+                this.underwaterPass.uniforms.time.value = time;
+            }
+        } else {
+            this.scene.fog.density = 0.0025;
+            this.scene.fog.color.setHex(this.defaultFogColor);
+            if (this.underwaterPass) {
+                this.underwaterPass.uniforms.enabled.value = 0.0;
+            }
+        }
+
+        if (this.water) this.water.update(time);
+        if (this.atmosphere) this.atmosphere.update(time);
+        
+        // Sync Network Players
+        if (this.networkPlayers) this.networkPlayers.update(delta);
+
+        if (this.player) {
+            if (isXR) {
+                // VR Update
+                this.player.updateVR(delta, (x, z) => this.getTerrainHeight(x, z), this.dolly, this.controllers, this.vrInput);
+                this.updateVRCamera();
+            } else if (this.cameraController) {
+                // Desktop Update
+                this.player.update(delta, (x, z) => this.getTerrainHeight(x, z), this.camera);
+                this.cameraController.update(this.terrain.getMesh());
+            }
+            
+            // 1. Broadcast Realtime Presence (Column 1) - High Frequency
+            this.presenceTimer += delta;
+            if (this.presenceTimer > 0.05) { // 20Hz update
+                this.presenceTimer = 0;
+                
+                // Infer state for animation
+                const isSwimming = this.player.position.y < this.player.waterLevel + 0.5;
+                
+                this.room.updatePresence({
+                    column1: {
+                        x: this.player.position.x,
+                        y: this.player.position.y,
+                        z: this.player.position.z,
+                        rot: this.player.rotation,
+                        state: isSwimming ? 'swim' : 'idle'
+                    }
+                });
+            }
+
+            // 2. Save to Database (Persistence) - Low Frequency
+            // This satisfies "each user gets 1 row" for persistent data
+            this.dbTimer = (this.dbTimer || 0) + delta;
+            if (this.dbTimer > 4.0) { // Save every 4 seconds
+                this.dbTimer = 0;
+                if (this.myRecordId) {
+                     this.room.collection('players').update(this.myRecordId, {
+                        column1: {
+                            x: this.player.position.x,
+                            y: this.player.position.y,
+                            z: this.player.position.z,
+                            rot: this.player.rotation
+                        }
+                    }).catch(e => console.warn("DB Auto-save failed", e));
+                }
+            }
+
+            // Update camera with terrain mesh for collision
+            this.cameraController.update(this.terrain.getMesh());
+        }
+    }
+
+    render() {
+        // Use composer instead of raw renderer
+        if (this.composer && !this.renderer.xr.isPresenting) {
+            this.composer.render();
+        } else {
+            this.renderer.render(this.scene, this.camera);
+        }
+    }
+
+    handleVRInput(dt) {
+        this.vrInput.move.set(0, 0);
+        this.vrInput.rotate = 0;
+
+        const session = this.renderer.xr.getSession();
+        if (session) {
+            for (const source of session.inputSources) {
+                if (!source.gamepad) continue;
+                const gp = source.gamepad;
+                
+                if (source.handedness === 'left') {
+                    // Left Stick: Move
+                    if (gp.axes.length >= 4) {
+                        this.vrInput.move.x = gp.axes[2];
+                        this.vrInput.move.y = gp.axes[3];
+                    }
+                    // Button X/Y to toggle view (usually index 4/5)
+                    if ((gp.buttons[4] && gp.buttons[4].pressed) || (gp.buttons[5] && gp.buttons[5].pressed)) {
+                         if (!this.vrInput.switchViewPressed) {
+                             this.toggleVRView();
+                             this.vrInput.switchViewPressed = true;
+                         }
+                    } else {
+                        // Reset latch on left only? Or both?
+                        // Let's reset if button not pressed
+                    }
+                }
+                
+                if (source.handedness === 'right') {
+                    // Right Stick: Turn
+                    if (gp.axes.length >= 4) {
+                        const turn = gp.axes[2];
+                        if (Math.abs(turn) > 0.5) {
+                            this.vrInput.rotate = -turn * 2.0; 
+                        }
+                    }
+                    // Button A/B (4/5)
+                    if ((gp.buttons[4] && gp.buttons[4].pressed) || (gp.buttons[5] && gp.buttons[5].pressed)) {
+                         if (!this.vrInput.switchViewPressed) {
+                             this.toggleVRView();
+                             this.vrInput.switchViewPressed = true;
+                         }
+                    }
+                }
+            }
+            
+            // Latch reset
+            let anyBtn = false;
+            for (const source of session.inputSources) {
+                if(source.gamepad && (source.gamepad.buttons[4]?.pressed || source.gamepad.buttons[5]?.pressed)) anyBtn = true;
+            }
+            if (!anyBtn) this.vrInput.switchViewPressed = false;
+        }
+    }
+
+    toggleVRView() {
+        this.vrViewMode = this.vrViewMode === '1st' ? '3rd' : '1st';
+    }
+
+    updateVRCamera() {
+        const pPos = this.player.position;
+        const pRot = this.player.rotation;
+
+        if (this.vrViewMode === '1st') {
+            // Standing mode: Dolly at player feet
+            this.dolly.position.set(pPos.x, pPos.y, pPos.z);
+            this.dolly.rotation.y = pRot; 
+        } else {
+            // Third Person
+            const dist = 4.0;
+            const height = 2.0;
+            const back = new THREE.Vector3(0, 0, dist).applyAxisAngle(new THREE.Vector3(0,1,0), pRot);
+            const targetPos = pPos.clone().add(back).add(new THREE.Vector3(0, height, 0));
+            this.dolly.position.lerp(targetPos, 0.1);
+            this.dolly.rotation.y = pRot;
+        }
+    }
+
+    onResize() {
+        this.camera.aspect = window.innerWidth / window.innerHeight;
+        this.camera.updateProjectionMatrix();
+        this.renderer.setSize(window.innerWidth, window.innerHeight);
+        if (this.composer) {
+            this.composer.setSize(window.innerWidth, window.innerHeight);
+        }
+    }
+
+    enableAudio() {
+        if (!this.audioContext) {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            this.audioContext = new AudioContext();
+            
+            const listener = new THREE.AudioListener();
+            this.camera.add(listener);
+
+            const audioLoader = new THREE.AudioLoader();
+            this.sound = new THREE.Audio(listener);
+
+            audioLoader.load('ambience.mp3', (buffer) => {
+                this.sound.setBuffer(buffer);
+                this.sound.setLoop(true);
+                this.sound.setVolume(0.5);
+                this.sound.play();
+            });
+        } else if (this.audioContext.state === 'suspended') {
+            this.audioContext.resume();
+        }
+    }
+}
