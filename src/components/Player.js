@@ -198,15 +198,61 @@ export class Player {
     update(dt, getTerrainHeight, camera) {
         if (this.isRemote) return;
 
-        // Standard Desktop update logic...
-        // ... existing code ...
-        // (Keep the existing update method as is, we will add updateVR separately)
+        const terrainHeight = getTerrainHeight(this.position.x, this.position.z);
         
-        // --- Copying existing update logic inside a guard or ensuring we don't duplicate code ---
-        // Ideally, refactor movement logic. For now, I'll let update() be called by desktop loop
-        // and create updateVR() for VR loop.
+        // Determine swimming
+        const depth = this.waterLevel - terrainHeight;
+        const isSwimming = (depth > 1.5) && (this.position.y < this.waterLevel + 0.5);
+        const speed = isSwimming ? this.swimSpeed : this.walkSpeed;
         
-        // ... existing code ...
+        // Movement Input
+        const moveDir = new THREE.Vector3(0, 0, 0);
+        if (this.keys.w) moveDir.z -= 1;
+        if (this.keys.s) moveDir.z += 1;
+        if (this.keys.a) moveDir.x -= 1;
+        if (this.keys.d) moveDir.x += 1;
+
+        if (moveDir.length() > 0) {
+            moveDir.normalize();
+            
+            // Relative to Camera
+            const camEuler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+            moveDir.applyAxisAngle(new THREE.Vector3(0, 1, 0), camEuler.y);
+            
+            // Rotate Player
+            const targetRot = Math.atan2(moveDir.x, moveDir.z);
+            let rotDiff = targetRot - this.rotation;
+            while (rotDiff > Math.PI) rotDiff -= Math.PI * 2;
+            while (rotDiff < -Math.PI) rotDiff += Math.PI * 2;
+            this.rotation += rotDiff * 10 * dt;
+        }
+
+        // Apply Position
+        this.position.x += moveDir.x * speed * dt;
+        this.position.z += moveDir.z * speed * dt;
+        
+        if (isSwimming) {
+             // Vertical Swim
+             if (this.keys.space) this.position.y += speed * 0.5 * dt;
+             if (this.keys.shift) this.position.y -= speed * 0.5 * dt;
+             
+             // Clamp
+             if (this.position.y > this.waterLevel - 0.5) this.position.y = this.waterLevel - 0.5;
+             if (this.position.y < terrainHeight + 1) this.position.y = terrainHeight + 1;
+             
+             // Body orientation for swimming (Horizontal)
+             this.bodyGroup.rotation.x = THREE.MathUtils.lerp(this.bodyGroup.rotation.x, Math.PI / 2, 5 * dt);
+        } else {
+             // Walking
+             this.position.y = terrainHeight + this.heightOffset;
+             this.bodyGroup.rotation.x = THREE.MathUtils.lerp(this.bodyGroup.rotation.x, 0, 10 * dt);
+        }
+        
+        this.bodyGroup.position.y = 0;
+
+        this.mesh.position.copy(this.position);
+        this.mesh.rotation.y = this.rotation;
+
         this.animateLimbs(dt, moveDir.length() > 0.1, isSwimming);
     }
 
